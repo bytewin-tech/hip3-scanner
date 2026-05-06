@@ -54,7 +54,7 @@ class ScanConfig:
     live_require_human_approval: bool = False
     # Hyperliquid API keys (set in .env)
     hl_wallet_address: str = ""
-    hl_secret_key_b64: str = ""
+    hl_private_key: str = ""        # Ethereum private key: 0x... 64 hex chars (MetaMask format)
     hl_base_url: str = "https://api.hyperliquid.xyz"
 
     @classmethod
@@ -86,8 +86,8 @@ class ScanConfig:
             data["live_require_human_approval"] = os.environ["HIP3_LIVE_REQUIRE_APPROVAL"].lower() in {"1", "true", "yes", "on"}
         if os.getenv("HIP3_HL_WALLET_ADDRESS"):
             data["hl_wallet_address"] = os.environ["HIP3_HL_WALLET_ADDRESS"]
-        if os.getenv("HIP3_HL_SECRET_KEY_B64"):
-            data["hl_secret_key_b64"] = os.environ["HIP3_HL_SECRET_KEY_B64"]
+        if os.getenv("HIP3_HL_PRIVATE_KEY"):
+            data["hl_private_key"] = os.environ["HIP3_HL_PRIVATE_KEY"]
         if os.getenv("HIP3_HL_BASE_URL"):
             data["hl_base_url"] = os.environ["HIP3_HL_BASE_URL"]
         return cls(**data)

@@ -1,19 +1,17 @@
-"""Hyperliquid exchange adapter.
+"""
+Hyperliquid exchange adapter using the hyperliquid CCXT package.
+
+Auth: Ethereum-style secp256k1 ECDSA private key + wallet address.
+The privateKey is your trading wallet private key (MetaMask format: 0x... 64 hex chars).
+NEVER commit real private keys — use .env only.
 
 Mode toggle:
-  - dry_run=True  (default)  → simulated fills, no real orders
-  - dry_run=False             → live order execution via Hyperliquid API
-
-To enable live trading:
-  1. Set DRY_RUN=false in .env
-  2. Fund the Hyperliquid testnet/mainnet wallet
-  3. (Optional) set LEDGER_SIZE to cap per-trade notional in live mode
+  dry_run=True  (default)  → simulated fills, no real orders
+  dry_run=False             → live order execution via Hyperliquid API
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import time
 from base64 import b64decode, b64encode
@@ -36,35 +34,22 @@ from ..exchanges import (
 
 
 # ---------------------------------------------------------------------------
-# Hyperliquid-specific constants
+# Hyperliquid constants
 # ---------------------------------------------------------------------------
 
 HL_BASE_URL = "https://api.hyperliquid.xyz"
 HL_TESTNET_URL = "https://api.hyperliquid-testnet.xyz"
 
-# Vaults / venues tracked by the scanner
-HL_VENUES = {"xyz", "flx", "vntl", "hyna", "km", "abcd", "para", "cash"}
-
 
 # ---------------------------------------------------------------------------
-# Wallet / signature helpers
-# ---------------------------------------------------------------------------
-
-def _sign_message(msg: dict[str, Any], secret_key_b64: str) -> str:
-    """HMAC-SHA256 sign a JSON message (Hyperliquid order signing)."""
-    payload = json.dumps(msg, separators=(",", ":"))
-    secret_bytes = b64decode(secret_key_b64)
-    sig = hmac.new(secret_bytes, payload.encode(), hashlib.sha256).digest()
-    return b64encode(sig).decode()
-
-
-# ---------------------------------------------------------------------------
-# Hyperliquid adapter
+# Hyperliquid adapter via CCXT
 # ---------------------------------------------------------------------------
 
 class HyperliquidAdapter(ExchangeAdapter):
     """
     Hyperliquid perpetuals exchange adapter.
+
+    Auth: requires wallet_address + private_key (Ethereum secp256k1 format).
 
     Per-trade notional is capped at `per_trade_notional` so a bad fill
     can never exceed the intended micro-live size.
@@ -75,34 +60,70 @@ class HyperliquidAdapter(ExchangeAdapter):
     def __init__(
         self,
         base_url: str = HL_BASE_URL,
-        wallet_address: str | None = None,
-        secret_key_b64: str | None = None,
+        wallet_address: str = "",
+        private_key: str = "",
         per_trade_notional: Decimal = Decimal("10"),
         dry_run: bool = True,
         slippage_bps: Decimal = Decimal("1.0"),
         simulate_fill_price_offset_bps: Decimal = Decimal("0.5"),
     ):
         self.base_url = base_url
-        self.wallet_address = wallet_address or ""
-        self.secret_key_b64 = secret_key_b64 or ""
+        self.wallet_address = wallet_address
+        self.private_key = private_key
         self.per_trade_notional = per_trade_notional
         self.dry_run = dry_run
-        self.slippage_bps = slippage_bps          # applied in dry_run
-        self.simulate_fill_offset = simulate_fill_price_offset_bps  # dry_run: worst-case fill offset
-        self._http = httpx.Client(timeout=15.0)
+        self.slippage_bps = slippage_bps
+        self.simulate_fill_offset = simulate_fill_price_offset_bps
         self._counter = 0
 
-    def close(self) -> None:
-        self._http.close()
+        # Lazy CCXT instance (only created in live mode)
+        self._ccxt: Any = None
 
-    # ---- ExchangeAdapter interface ----
+    def close(self) -> None:
+        if self._ccxt is not None:
+            try:
+                self._ccxt.close()
+            except Exception:
+                pass
+            self._ccxt = None
+
+    # ---------------------------------------------------------------------------
+    # CCXT lazy init
+    # ---------------------------------------------------------------------------
+
+    def _get_ccxt(self) -> Any:
+        """Lazily create and configure the CCXT hyperliquid instance."""
+        if self._ccxt is None:
+            from hyperliquid import HyperliquidSync
+
+            self._ccxt = HyperliquidSync({
+                "enableRateLimit": True,
+                "options": {
+                    "defaultSlippage": str(float(self.slippage_bps) / 100.0),
+                },
+            })
+
+            # Set credentials (required: wallet_address + private_key)
+            self._ccxt.walletAddress = self.wallet_address
+            self._ccxt.privateKey = self.private_key  # 0x... hex string
+
+        return self._ccxt
+
+    # ---------------------------------------------------------------------------
+    # ExchangeAdapter interface
+    # ---------------------------------------------------------------------------
 
     def health_check(self) -> OrderResult:
         if self.dry_run:
             return OrderResult(success=True, order_id="DRY_RUN", status=OrderStatus.OPEN)
         try:
-            resp = self._post({"type": "userContext", "user": self.wallet_address})
-            if resp.get("status") == "ok":
+            ccxt = self._get_ccxt()
+            # Ping user context
+            resp = ccxt.public_post_info({
+                "type": "userContext",
+                "user": self.wallet_address,
+            })
+            if resp and resp.get("status") == "ok":
                 return OrderResult(success=True, order_id="HEALTH_OK", status=OrderStatus.OPEN)
             return OrderResult(success=False, error="health_check failed", status=OrderStatus.FAILED)
         except Exception as exc:
@@ -128,11 +149,11 @@ class HyperliquidAdapter(ExchangeAdapter):
         if self.dry_run:
             return OrderResult(success=True, order_id=order_id, status=OrderStatus.CANCELLED)
         try:
-            payload = self._build_broker_cancel(self.wallet_address, order_id, symbol)
-            resp = self._post(payload)
-            if resp.get("status") == "ok":
+            ccxt = self._get_ccxt()
+            result = ccxt.cancel_order(symbol=symbol, id=order_id)
+            if result and result.get("status") == "canceled":
                 return OrderResult(success=True, order_id=order_id, status=OrderStatus.CANCELLED)
-            return OrderResult(success=False, order_id=order_id, error=str(resp), status=OrderStatus.FAILED)
+            return OrderResult(success=False, order_id=order_id, error=str(result), status=OrderStatus.FAILED)
         except Exception as exc:
             return OrderResult(success=False, order_id=order_id, error=str(exc), status=OrderStatus.FAILED)
 
@@ -140,44 +161,44 @@ class HyperliquidAdapter(ExchangeAdapter):
         if self.dry_run:
             return OrderResult(success=True, order_id=order_id, status=OrderStatus.FILLED)
         try:
-            payload = {
-                "type": "orderStatus",
-                "user": self.wallet_address,
-                "orderId": order_id,
+            ccxt = self._get_ccxt()
+            order = ccxt.fetch_order(id=order_id, symbol=symbol)
+            status_map = {
+                "open": OrderStatus.OPEN,
+                "closed": OrderStatus.FILLED,
+                "filled": OrderStatus.FILLED,
+                "canceled": OrderStatus.CANCELLED,
+                "rejected": OrderStatus.REJECTED,
             }
-            resp = self._post(payload)
-            status = resp.get("order", {}).get("status", "")
-            if status == "filled":
-                return OrderResult(success=True, order_id=order_id, status=OrderStatus.FILLED)
-            elif status == "open":
-                return OrderResult(success=True, order_id=order_id, status=OrderStatus.OPEN)
-            else:
-                return OrderResult(success=False, order_id=order_id, status=OrderStatus.FAILED)
+            mapped = status_map.get(order.get("status", ""), OrderStatus.FAILED)
+            return OrderResult(
+                success=mapped in (OrderStatus.OPEN, OrderStatus.FILLED),
+                order_id=order_id,
+                status=mapped,
+            )
         except Exception as exc:
             return OrderResult(success=False, order_id=order_id, error=str(exc), status=OrderStatus.FAILED)
 
     def get_balance(self) -> BalanceInfo:
         if self.dry_run:
+            # Return a small dry-run balance
+            avail = float(self.per_trade_notional) * 10
             return BalanceInfo(
-                available=self.per_trade_notional * 10,
-                total=self.per_trade_notional * 10,
+                available=Decimal(str(avail)),
+                total=Decimal(str(avail)),
                 locked=Decimal(0),
                 timestamp_iso=self.get_timestamp_iso(),
             )
         try:
-            payload = {
-                "type": "userState",
-                "user": self.wallet_address,
-            }
-            resp = self._post(payload)
-            # Hyperliquid returns account value / margin summary
-            # field names: "marginSummary" -> { "accountValue", "totalMarginUsed" }
-            margin = resp.get("marginSummary", {})
-            avail = Decimal(str(margin.get("totalEq", margin.get("accountValue", "0"))))
-            locked = Decimal(str(margin.get("totalMarginUsed", "0")))
+            ccxt = self._get_ccxt()
+            balance = ccxt.fetch_balance()
+            # Hyperliquid uses "USDC" for margin
+            total = Decimal(str(balance.get("total", {}).get("USDC", 0)))
+            free = Decimal(str(balance.get("free", {}).get("USDC", 0)))
+            locked = Decimal(str(balance.get("used", {}).get("USDC", 0)))
             return BalanceInfo(
-                available=avail - locked,
-                total=avail,
+                available=free,
+                total=total,
                 locked=locked,
                 timestamp_iso=self.get_timestamp_iso(),
             )
@@ -193,29 +214,27 @@ class HyperliquidAdapter(ExchangeAdapter):
         if self.dry_run:
             return None
         try:
-            payload = {
-                "type": "positions",
-                "user": self.wallet_address,
-            }
-            resp = self._post(payload)
-            for pos in resp if isinstance(resp, list) else []:
-                if pos.get("coin") == symbol:
-                    return PositionInfo(
-                        underlying_key=symbol,
-                        size=Decimal(str(pos.get("size", 0))),
-                        entry_price=Decimal(str(pos.get("entryPx", 0))),
-                        unrealized_pnl=Decimal(str(pos.get("unrealizedPnl", 0))),
-                        margin_used=Decimal(str(pos.get("marginUsed", 0))),
-                        timestamp_iso=self.get_timestamp_iso(),
-                    )
-            return None
+            ccxt = self._get_ccxt()
+            pos = ccxt.fetch_position(symbol=symbol)
+            if not pos or not pos.get("contracts"):
+                return None
+            return PositionInfo(
+                underlying_key=symbol,
+                size=Decimal(str(pos.get("contracts", 0))),
+                entry_price=Decimal(str(pos.get("entryPrice", 0))),
+                unrealized_pnl=Decimal(str(pos.get("unrealizedPnl", 0))),
+                margin_used=Decimal(str(pos.get("initialMargin", 0))),
+                timestamp_iso=self.get_timestamp_iso(),
+            )
         except Exception:
             return None
 
     def get_order_type_abi(self) -> str:
         return "Market"
 
-    # ---- Internal helpers ----
+    # ---------------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------------
 
     def _next_id(self) -> str:
         self._counter += 1
@@ -232,11 +251,9 @@ class HyperliquidAdapter(ExchangeAdapter):
         """
         Execute a market order.
 
-        In dry_run mode: simulate a realistic fill at worst-case price
-        (entry price shifted by slippage_bps).
-
-        In live mode: sign + submit a Hyperliquid market order via the
-        /exchange endpoint. Notional is capped at self.per_trade_notional.
+        In dry_run mode: simulate a realistic fill at worst-case price.
+        In live mode: use CCXT to place a real Hyperliquid market order.
+        Notional is capped at self.per_trade_notional.
         """
         # Cap notional to prevent over-exposure
         estimated_price = kwargs.get("price", Decimal("1"))
@@ -257,14 +274,14 @@ class HyperliquidAdapter(ExchangeAdapter):
         """Simulate a realistic worst-case fill in dry_run mode."""
         slip = base_price * self.slippage_bps / Decimal("10000")
         fill_price = base_price + slip if side == OrderSide.BUY else base_price - slip
-
         order_id = self._next_id()
+
         fill = Fill(
             order_id=order_id,
             side=side,
             price=fill_price,
             size=quantity,
-            fee=fill_price * quantity * Decimal("0.0004"),   # 4 bps maker fee (approximate)
+            fee=fill_price * quantity * Decimal("0.0004"),   # 4 bps maker fee approximation
             fee_currency="USDC",
             ts_iso=self.get_timestamp_iso(),
         )
@@ -284,101 +301,72 @@ class HyperliquidAdapter(ExchangeAdapter):
         quantity: Decimal,
         side: OrderSide,
     ) -> OrderResult:
-        """Sign and submit a real Hyperliquid market order."""
-        if not self.wallet_address or not self.secret_key_b64:
+        """Place a real Hyperliquid market order via CCXT."""
+        if not self.wallet_address or not self.private_key:
             return OrderResult(
                 success=False,
-                error="wallet_address and secret_key_b64 required for live trading",
+                error="wallet_address and private_key required for live trading",
                 status=OrderStatus.FAILED,
             )
 
         order_id = self._next_id()
-        ts_ms = int(time.time() * 1000)
-
-        msg = {
-            "type": "order",
-            "user": self.wallet_address,
-            "order": {
-                "id": order_id,
-                "side": side.value.capitalize(),
-                "asset": symbol,
-                "size": str(quantity),
-                "price": "0",                 # market order: price = 0
-                "orderType": {"type": "Market"},
-                "fillOrKill": False,
-                "timeInForce": {"type": "GTC"},
-                "reduceOnly": False,
-                "loopTimeInForce": False,
-            },
-            "action": {
-                "type": "order",
-                "hyperdrive": True,
-                "isMarketSale": True,
-            },
-            "nonce": ts_ms,
-            "signature": "",  # filled below
-        }
 
         try:
-            msg["signature"] = _sign_message(msg, self.secret_key_b64)
-        except Exception as exc:
-            return OrderResult(success=False, error=f"signing failed: {exc}", status=OrderStatus.FAILED)
+            ccxt = self._get_ccxt()
+            # CCXT market orders: amount is in base currency (e.g. BTC, not USD)
+            # For perpetuals on Hyperliquid, symbol like "BTC/USDC:USDC" -> amount = BTC qty
+            # We need to convert USD notional to base qty
+            estimated_price = 1  # rough estimate; CCXT uses market price
+            base_qty = float(quantity / estimated_price)
 
-        try:
-            resp = self._post({"type": "exchange", "orders": [msg["order"]]})
-            if isinstance(resp, dict) and resp.get("status") == "ok":
-                # Hyperliquid fills immediately for market orders
-                fills_raw = resp.get("response", {}).get("data", {}).get("fills", [])
-                fills = [
-                    Fill(
-                        order_id=order_id,
-                        side=side,
-                        price=Decimal(str(f.get("px", 0))),
-                        size=Decimal(str(f.get("sz", 0))),
-                        fee=Decimal(str(f.get("fee", 0))),
-                        fee_currency="USDC",
-                        ts_iso=self.get_timestamp_iso(),
-                    )
-                    for f in fills_raw
-                ]
-                total_size = sum(f.size for f in fills)
-                total_fee = sum(f.fee for f in fills)
-                avg_price = (
-                    sum(f.price * f.size for f in fills) / total_size
-                    if total_size > 0 else Decimal(0)
-                )
-                return OrderResult(
-                    success=True,
-                    order_id=order_id,
-                    status=OrderStatus.FILLED if fills else OrderStatus.OPEN,
-                    fills=fills,
-                    avg_fill_price=avg_price,
-                    total_filled_size=total_size,
-                    total_fee=total_fee,
-                )
-            return OrderResult(success=False, error=str(resp), status=OrderStatus.FAILED)
-        except httpx.HTTPStatusError as exc:
-            return OrderResult(
-                success=False,
-                order_id=order_id,
-                error=f"HTTP {exc.response.status_code}: {exc.response.text}",
-                status=OrderStatus.FAILED,
+            result = ccxt.create_market_order(
+                symbol=symbol,
+                side=side.value,
+                amount=base_qty,
             )
+
+            # Parse fills from result
+            fills = []
+            total_size = Decimal(0)
+            total_fee = Decimal(0)
+            avg_price = Decimal(0)
+            filled_qty_total = Decimal(0)
+
+            for trade in result.get("trades", []):
+                px = Decimal(str(trade.get("price", 0)))
+                sz = Decimal(str(trade.get("amount", 0)))
+                fee = Decimal(str(trade.get("fee", {}).get("cost", 0)))
+                fills.append(Fill(
+                    order_id=order_id,
+                    side=side,
+                    price=px,
+                    size=sz,
+                    fee=fee,
+                    fee_currency=str(trade.get("fee", {}).get("currency", "USDC")),
+                    ts_iso=trade.get("timestamp", self.get_timestamp_iso()),
+                ))
+                total_size += sz
+                total_fee += fee
+                avg_price += px * sz
+                filled_qty_total += sz
+
+            if filled_qty_total > 0:
+                avg_price = avg_price / filled_qty_total
+
+            status = OrderStatus.FILLED if filled_qty_total > 0 else OrderStatus.OPEN
+
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                status=status,
+                fills=fills,
+                avg_fill_price=avg_price,
+                total_filled_size=filled_qty_total,
+                total_fee=total_fee,
+            )
+
         except Exception as exc:
             return OrderResult(success=False, order_id=order_id, error=str(exc), status=OrderStatus.FAILED)
-
-    def _build_broker_cancel(self, user: str, order_id: str, symbol: str) -> dict[str, Any]:
-        return {
-            "type": "brokerCancel",
-            "user": user,
-            "info": {"id": order_id, "symbol": symbol},
-            "nonce": int(time.time() * 1000),
-        }
-
-    def _post(self, payload: dict[str, Any]) -> Any:
-        resp = self._http.post(self.base_url, json=payload)
-        resp.raise_for_status()
-        return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +381,11 @@ def build_hyperliquid_adapter(
     Build a HyperliquidAdapter from a config dict (from .env or JSON).
 
     Keys expected:
-      HL_WALLET_ADDRESS
-      HL_SECRET_KEY_B64
-      HL_BASE_URL          (optional, defaults to mainnet)
-      DRY_RUN              (optional, default True)
-      PER_TRADE_NOTIONAL   (optional, default 10)
-      SLIPPAGE_BPS         (optional, default 1.0)
+      hl_wallet_address      — Ethereum wallet address (0x...)
+      hl_private_key         — Ethereum private key (0x... 64 hex chars)
+      hl_base_url           — optional, defaults to mainnet
+      dry_run               — optional, default True
+      slippage_bps          — optional, default 1.0
     """
     import os as _os
 
@@ -407,7 +394,7 @@ def build_hyperliquid_adapter(
     return HyperliquidAdapter(
         base_url=config.get("hl_base_url", HL_BASE_URL),
         wallet_address=config.get("hl_wallet_address", ""),
-        secret_key_b64=config.get("hl_secret_key_b64", ""),
+        private_key=config.get("hl_private_key", ""),
         per_trade_notional=per_trade_notional,
         dry_run=dry_run,
         slippage_bps=Decimal(str(config.get("slippage_bps", "1.0"))),

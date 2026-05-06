@@ -24,7 +24,7 @@ class ScannerService:
             adapter = HyperliquidAdapter(
                 base_url=config.hl_base_url,
                 wallet_address=config.hl_wallet_address,
-                secret_key_b64=config.hl_secret_key_b64,
+                private_key=config.hl_private_key,
                 per_trade_notional=config.paper_per_trade_notional_usd,
                 dry_run=config.live_dry_run,
             )
