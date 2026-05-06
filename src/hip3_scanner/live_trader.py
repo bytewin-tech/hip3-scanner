@@ -222,13 +222,14 @@ class LiveTrader:
                 position["unrealized_pnl_usd"] = round(float(exchange_pos.unrealized_pnl), 6)
                 position["last_exec_spread_bps"] = current_exec
             else:
-                # Fall back to spread PnL (dry_run or position not yet on exchange)
-                spread_pnl = self._spread_pnl(
-                    position["entry_exec_spread_bps"],
-                    current_exec,
-                    position["notional_usd"],
-                )
-                position["unrealized_pnl_usd"] = spread_pnl
+                # Fall back to fill-price PnL (dry_run or position not yet on exchange)
+                entry_px = Decimal(str(position.get("entry_fill_price", position["entry_exec_spread_bps"])))
+                # Current price: estimate from spread
+                spread_bps = Decimal(str(current_exec))
+                current_px = entry_px * (BPS_DIVISOR + spread_bps) / BPS_DIVISOR
+                notional = Decimal(str(position["notional_usd"]))
+                unrealized = (current_px - entry_px) * (notional / entry_px)
+                position["unrealized_pnl_usd"] = round(float(unrealized), 6)
                 position["last_exec_spread_bps"] = current_exec
 
             position["last_scan_ts_ms"] = result["ts_ms"]
@@ -262,10 +263,14 @@ class LiveTrader:
                 closed["close_reason"] = close_reason
                 closed["closed_ts_ms"] = result["ts_ms"]
                 closed["closed_ts_iso"] = result["ts_iso"]
-                # Realized PnL from actual fill
-                realized = sum(f.price * f.size for f in fill_result.fills)
-                cost_basis = position["entry_exec_spread_bps"] / BPS_DIVISOR * position["notional_usd"]
-                closed["realized_pnl_usd"] = round(float(realized - Decimal(str(cost_basis))), 6)
+                # Realized PnL from actual fill prices (entry vs exit)
+                if fill_result.fills:
+                    close_px = sum(f.price * f.size for f in fill_result.fills) / sum(f.size for f in fill_result.fills)
+                    entry_px = Decimal(str(position.get("entry_fill_price", 0)))
+                    close_qty = sum(f.size for f in fill_result.fills)
+                    realized = close_px * close_qty
+                    cost_basis = entry_px * close_qty
+                    closed["realized_pnl_usd"] = round(float(realized - cost_basis), 6)
                 state["cash_usd"] = round(state["cash_usd"] + position["notional_usd"] + closed["realized_pnl_usd"], 6)
                 state["realized_pnl_usd"] = round(state["realized_pnl_usd"] + closed["realized_pnl_usd"], 6)
                 state["closed_positions"].append(closed)
@@ -344,6 +349,12 @@ class LiveTrader:
                     "signal_present": True,
                     "entry_fill_id": fill_result.order_id,
                 }
+                # Store actual entry fill price for real PnL calc on close
+                if fill_result.fills:
+                    avg = sum(f.price * f.size for f in fill_result.fills) / sum(f.size for f in fill_result.fills)
+                    position["entry_fill_price"] = float(avg)
+                else:
+                    position["entry_fill_price"] = 0.0
                 state["positions"].append(position)
                 state["cash_usd"] = round(state["cash_usd"] - notional, 6)
                 state["fills"].append(self._fill_to_dict(fill_result, "entry"))

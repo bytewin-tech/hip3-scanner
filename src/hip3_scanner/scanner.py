@@ -78,53 +78,50 @@ class ScannerService:
 
 
 def format_console(result: dict[str, Any]) -> str:
-    lines = [
-        f"scan_ts={result['ts_iso']} markets={result['markets_scanned']} duplicate_underlyings={result['duplicate_underlyings']} opps={len(result['opportunities'])}",
-        "rank | underlying | direction | tier | exec_bps | funding_bps | oracle_bps | score",
-        "-----|------------|-----------|------|----------|-------------|------------|------",
-    ]
-    paper = result.get("paper_portfolio")
-    if paper:
-        lines.extend(
-            [
-                (
-                    "paper | start=$%.2f cash=$%.2f equity=$%.2f open=%d realized=$%.2f unrealized=$%.2f total=$%.2f"
-                    % (
-                        paper["starting_equity_usd"],
-                        paper["cash_usd"],
-                        paper["equity_usd"],
-                        paper["open_positions"],
-                        paper["realized_pnl_usd"],
-                        paper["unrealized_pnl_usd"],
-                        paper["total_pnl_usd"],
-                    )
-                ),
-                "",
-            ]
-        )
-    live = result.get("live_portfolio")
-    if live:
-        mode = "DRY_RUN" if live.get("dry_run") else "LIVE"
-        paused = " [PAUSED]" if live.get("safety_paused") else ""
-        lines.extend(
-            [
-                (
-                    f"live  | {mode} | equity=$%.2f open=%d realized=$%.2f unrealized=$%.2f total=$%.2f{paused}"
-                    % (
-                        live["equity_usd"],
-                        live["open_positions"],
-                        live["realized_pnl_usd"],
-                        live["unrealized_pnl_usd"],
-                        live["total_pnl_usd"],
-                    )
-                ),
-                "",
-            ]
-        )
+    lines = []
+    if result.get("paper_portfolio") or result.get("live_portfolio"):
+        paper = result.get("paper_portfolio")
+        live = result.get("live_portfolio")
+        parts = []
+        if paper:
+            parts.append(
+                f"paper | start=$%.2f cash=$%.2f equity=$%.2f open=%d realized=$%.2f unrealized=$%.2f total=$%.2f"
+                % (
+                    paper["starting_equity_usd"],
+                    paper["cash_usd"],
+                    paper["equity_usd"],
+                    paper["open_positions"],
+                    paper["realized_pnl_usd"],
+                    paper["unrealized_pnl_usd"],
+                    paper["total_pnl_usd"],
+                )
+            )
+        if live:
+            mode = "DRY_RUN" if live.get("dry_run") else "LIVE"
+            paused = " [PAUSED]" if live.get("safety_paused") else ""
+            parts.append(
+                f"live  | {mode} | equity=$%.2f open=%d realized=$%.2f unrealized=$%.2f total=$%.2f{paused}"
+                % (
+                    live["equity_usd"],
+                    live["open_positions"],
+                    live["realized_pnl_usd"],
+                    live["unrealized_pnl_usd"],
+                    live["total_pnl_usd"],
+                )
+            )
+        lines.extend(parts)
+        lines.append("")
+
+    lines.append(
+        f"scan_ts={result['ts_iso']} markets={result['markets_scanned']} duplicate_underlyings={result['duplicate_underlyings']} opps={len(result['opportunities'])}"
+    )
+    lines.append(
+        "  # | Underlying | Direction            | Tier               | Exec bps | Funding bps | Oracle bps | Score"
+    )
     for idx, opp in enumerate(result["opportunities"], start=1):
         direction = f"buy {opp['direction']['buy_venue']} / sell {opp['direction']['sell_venue']}"
         exec_bps = opp["metrics"]["l2_executable_spread_bps"] or opp["metrics"]["impact_executable_spread_bps"]
         lines.append(
-            f"{idx:>4} | {opp['underlying_key']:<10} | {direction:<19} | {opp['score']['tier']:<16} | {exec_bps:>8} | {opp['metrics']['funding_spread_bps']:>11} | {opp['metrics']['oracle_divergence_bps']:>10} | {opp['score']['raw_score']:>6}"
+            f"{idx:>3} | {opp['underlying_key']:<10} | {direction:<20} | {opp['score']['tier']:<16} | {exec_bps:>9} | {opp['metrics']['funding_spread_bps']:>12} | {opp['metrics']['oracle_divergence_bps']:>11} | {opp['score']['raw_score']:>6}"
         )
     return "\n".join(lines)

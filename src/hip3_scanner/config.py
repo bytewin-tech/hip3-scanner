@@ -5,6 +5,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 DEFAULT_VENUES = ["xyz", "flx", "vntl", "hyna", "km", "abcd", "cash", "para"]
 
 

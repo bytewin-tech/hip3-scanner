@@ -257,7 +257,7 @@ class HyperliquidAdapter(ExchangeAdapter):
         """
         # Cap notional to prevent over-exposure
         estimated_price = kwargs.get("price", Decimal("1"))
-        qty = min(quantity, self.per_trade_notional / estimated_price)
+        qty = min(quantity, Decimal(str(self.per_trade_notional)) / estimated_price)
 
         if self.dry_run:
             return self._simulate_fill(symbol, qty, side, estimated_price)
