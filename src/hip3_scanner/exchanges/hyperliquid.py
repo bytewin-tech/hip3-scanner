@@ -103,9 +103,23 @@ class HyperliquidAdapter(ExchangeAdapter):
                 },
             })
 
+            # Override URLs for testnet (urls['api'] is a dict, not a string)
+            if self.base_url != HL_BASE_URL:
+                self._ccxt.urls["api"] = {
+                    "public": self.base_url,
+                    "private": self.base_url,
+                }
+
             # Set credentials (required: wallet_address + private_key)
             self._ccxt.walletAddress = self.wallet_address
             self._ccxt.privateKey = self.private_key  # 0x... hex string
+
+            # Load markets — wrap in try/except because testnet spot markets
+            # can fail with TypeError (None base currency from API)
+            try:
+                self._ccxt.load_markets()
+            except Exception:
+                pass  # Markets may be unavailable; order submission handles this
 
         return self._ccxt
 
@@ -390,6 +404,9 @@ def build_hyperliquid_adapter(
     import os as _os
 
     dry_run = _os.getenv("DRY_RUN", "true").lower() not in {"false", "0", "no"}
+    # Also check HIP3_LIVE_DRY_RUN (used by the config system)
+    if _os.getenv("HIP3_LIVE_DRY_RUN", "").lower() in {"false", "0", "no"}:
+        dry_run = False
 
     return HyperliquidAdapter(
         base_url=config.get("hl_base_url", HL_BASE_URL),
