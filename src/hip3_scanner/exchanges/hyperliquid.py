@@ -164,7 +164,7 @@ class HyperliquidAdapter(ExchangeAdapter):
             return OrderResult(success=True, order_id=order_id, status=OrderStatus.CANCELLED)
         try:
             ccxt = self._get_ccxt()
-            result = ccxt.cancel_order(symbol=symbol, id=order_id)
+            result = ccxt.cancel_order(symbol=self._ccxt_symbol(symbol), id=order_id)
             if result and result.get("status") == "canceled":
                 return OrderResult(success=True, order_id=order_id, status=OrderStatus.CANCELLED)
             return OrderResult(success=False, order_id=order_id, error=str(result), status=OrderStatus.FAILED)
@@ -176,7 +176,7 @@ class HyperliquidAdapter(ExchangeAdapter):
             return OrderResult(success=True, order_id=order_id, status=OrderStatus.FILLED)
         try:
             ccxt = self._get_ccxt()
-            order = ccxt.fetch_order(id=order_id, symbol=symbol)
+            order = ccxt.fetch_order(id=order_id, symbol=self._ccxt_symbol(symbol))
             status_map = {
                 "open": OrderStatus.OPEN,
                 "closed": OrderStatus.FILLED,
@@ -229,7 +229,7 @@ class HyperliquidAdapter(ExchangeAdapter):
             return None
         try:
             ccxt = self._get_ccxt()
-            pos = ccxt.fetch_position(symbol=symbol)
+            pos = ccxt.fetch_position(symbol=self._ccxt_symbol(symbol))
             if not pos or not pos.get("contracts"):
                 return None
             return PositionInfo(
@@ -309,6 +309,21 @@ class HyperliquidAdapter(ExchangeAdapter):
             total_fee=fill.fee,
         )
 
+    def _ccxt_symbol(self, symbol: str) -> str:
+        """
+        Convert a bare perpetual symbol to CCXT Hyperliquid format.
+
+        The scanner emits bare names (e.g. "TSLA", "BTC") which CCXT
+        doesn't recognise. Hyperliquid perpetuals use the format:
+          NAME/USDC:USDC   e.g. "TSLA/USDC:USDC"
+
+        If the symbol already contains "/" or ":" it is assumed to already
+        be in CCXT format and is returned unchanged.
+        """
+        if "/" in symbol or ":" in symbol:
+            return symbol
+        return f"{symbol}/USDC:USDC"
+
     def _submit_live_order(
         self,
         symbol: str,
@@ -324,6 +339,7 @@ class HyperliquidAdapter(ExchangeAdapter):
             )
 
         order_id = self._next_id()
+        ccxt_symbol = self._ccxt_symbol(symbol)
 
         try:
             ccxt = self._get_ccxt()
@@ -334,7 +350,7 @@ class HyperliquidAdapter(ExchangeAdapter):
             base_qty = float(quantity / estimated_price)
 
             result = ccxt.create_market_order(
-                symbol=symbol,
+                symbol=ccxt_symbol,
                 side=side.value,
                 amount=base_qty,
             )
