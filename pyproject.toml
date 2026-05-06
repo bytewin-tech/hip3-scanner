@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hip3-scanner"
+version = "0.1.0"
+description = "MVP read-only Hyperliquid HIP-3 cross-DEX scanner"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Hermes Agent" }]
+dependencies = [
+  "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+hip3-scan = "hip3_scanner.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
