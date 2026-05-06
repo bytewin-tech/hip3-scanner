@@ -14,8 +14,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", dest="config_path", help="Path to JSON config")
     parser.add_argument("--interval", type=int, help="Loop interval seconds")
     parser.add_argument("--top", type=int, help="Max opportunities to print/store")
-    parser.add_argument("--paper", action="store_true", help="Enable $1,000 paper trader / PnL simulation")
+    parser.add_argument("--paper", action="store_true", help="Enable paper trader (simulated PnL, $1,000 starting)")
     parser.add_argument("--paper-state", help="Override paper trader state path")
+    parser.add_argument("--live", action="store_true", help="Enable live trader (real money — use with caution)")
+    parser.add_argument("--live-state", help="Override live trader state path")
     return parser
 
 
@@ -31,6 +33,11 @@ def main() -> int:
         config.paper_trader_enabled = True
     if args.paper_state:
         config.paper_state_path = args.paper_state
+    if args.live:
+        config.live_enabled = True
+        print("⚠️  LIVE TRADING ENABLED — real orders will be placed")
+    if args.live_state:
+        config.live_state_path = args.live_state
     service = ScannerService(config)
     try:
         if args.command == "once":

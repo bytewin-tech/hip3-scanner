@@ -9,6 +9,8 @@ from typing import Any
 from .client import HyperliquidClient
 from .config import ScanConfig
 from .core import evaluate_opportunities, normalize_market_snapshots, parse_venue_info
+from .exchanges.hyperliquid import HyperliquidAdapter
+from .live_trader import LiveTrader, build_live_trader_config
 from .paper import PaperTrader, build_paper_trader_config
 
 
@@ -17,9 +19,24 @@ class ScannerService:
         self.config = config
         self.client = client or HyperliquidClient()
         self.paper_trader = PaperTrader(build_paper_trader_config(config)) if config.paper_trader_enabled else None
+        self.live_trader: LiveTrader | None = None
+        if config.live_enabled:
+            adapter = HyperliquidAdapter(
+                base_url=config.hl_base_url,
+                wallet_address=config.hl_wallet_address,
+                secret_key_b64=config.hl_secret_key_b64,
+                per_trade_notional=config.paper_per_trade_notional_usd,
+                dry_run=config.live_dry_run,
+            )
+            self.live_trader = LiveTrader(
+                build_live_trader_config(config, dry_run=config.live_dry_run),
+                adapter,
+            )
 
     def close(self) -> None:
         self.client.close()
+        if self.live_trader is not None:
+            self.live_trader.adapter.close()
 
     def _fetch_book(self, market_id: str, venue: str) -> dict[str, Any]:
         return self.client.fetch_l2_book(market_id, venue)
@@ -45,6 +62,8 @@ class ScannerService:
         }
         if self.paper_trader is not None:
             result["paper_portfolio"] = self.paper_trader.update(result)
+        if self.live_trader is not None:
+            result["live_portfolio"] = self.live_trader.update(result)
         self._write_jsonl(result)
         return result
 
@@ -78,6 +97,25 @@ def format_console(result: dict[str, Any]) -> str:
                         paper["realized_pnl_usd"],
                         paper["unrealized_pnl_usd"],
                         paper["total_pnl_usd"],
+                    )
+                ),
+                "",
+            ]
+        )
+    live = result.get("live_portfolio")
+    if live:
+        mode = "DRY_RUN" if live.get("dry_run") else "LIVE"
+        paused = " [PAUSED]" if live.get("safety_paused") else ""
+        lines.extend(
+            [
+                (
+                    f"live  | {mode} | equity=$%.2f open=%d realized=$%.2f unrealized=$%.2f total=$%.2f{paused}"
+                    % (
+                        live["equity_usd"],
+                        live["open_positions"],
+                        live["realized_pnl_usd"],
+                        live["unrealized_pnl_usd"],
+                        live["total_pnl_usd"],
                     )
                 ),
                 "",

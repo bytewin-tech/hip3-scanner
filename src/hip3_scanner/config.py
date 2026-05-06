@@ -47,6 +47,15 @@ class ScanConfig:
     paper_volatility_spike_bps: float = 25.0  # halt entries if median spread > 25 bps across venues
     paper_api_stale_threshold_seconds: int = 120  # halt if no fresh data in 2 minutes
     paper_cooldown_scans: int = 10  # how many scans to skip after a safety pause
+    # Live trading (real money)
+    live_enabled: bool = False
+    live_state_path: str = "./output/live_trader_state.json"
+    live_dry_run: bool = True
+    live_require_human_approval: bool = False
+    # Hyperliquid API keys (set in .env)
+    hl_wallet_address: str = ""
+    hl_secret_key_b64: str = ""
+    hl_base_url: str = "https://api.hyperliquid.xyz"
 
     @classmethod
     def from_sources(cls, config_path: str | None = None) -> "ScanConfig":
@@ -66,4 +75,19 @@ class ScanConfig:
             data["paper_trader_enabled"] = os.environ["HIP3_PAPER_TRADER_ENABLED"].lower() in {"1", "true", "yes", "on"}
         if os.getenv("HIP3_PAPER_STATE_PATH"):
             data["paper_state_path"] = os.environ["HIP3_PAPER_STATE_PATH"]
+        # Live trading
+        if os.getenv("HIP3_LIVE_ENABLED"):
+            data["live_enabled"] = os.environ["HIP3_LIVE_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if os.getenv("HIP3_LIVE_STATE_PATH"):
+            data["live_state_path"] = os.environ["HIP3_LIVE_STATE_PATH"]
+        if os.getenv("HIP3_LIVE_DRY_RUN"):
+            data["live_dry_run"] = os.environ["HIP3_LIVE_DRY_RUN"].lower() not in {"0", "false", "no"}
+        if os.getenv("HIP3_LIVE_REQUIRE_APPROVAL"):
+            data["live_require_human_approval"] = os.environ["HIP3_LIVE_REQUIRE_APPROVAL"].lower() in {"1", "true", "yes", "on"}
+        if os.getenv("HIP3_HL_WALLET_ADDRESS"):
+            data["hl_wallet_address"] = os.environ["HIP3_HL_WALLET_ADDRESS"]
+        if os.getenv("HIP3_HL_SECRET_KEY_B64"):
+            data["hl_secret_key_b64"] = os.environ["HIP3_HL_SECRET_KEY_B64"]
+        if os.getenv("HIP3_HL_BASE_URL"):
+            data["hl_base_url"] = os.environ["HIP3_HL_BASE_URL"]
         return cls(**data)
