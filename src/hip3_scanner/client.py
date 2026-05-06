@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -13,10 +14,29 @@ class HyperliquidClient:
     def close(self) -> None:
         self._client.close()
 
-    def post(self, payload: dict[str, Any]) -> Any:
-        response = self._client.post(self.base_url, json=payload)
-        response.raise_for_status()
-        return response.json()
+    def post(self, payload: dict[str, Any], _retries: int = 3) -> Any:
+        for attempt in range(_retries):
+            try:
+                response = self._client.post(self.base_url, json=payload)
+            except httpx.TimeoutException:
+                if attempt == _retries - 1:
+                    raise
+                time.sleep(2 ** attempt)
+                continue
+            except httpx.ConnectError:
+                if attempt == _retries - 1:
+                    raise
+                time.sleep(2 ** attempt)
+                continue
+            if response.status_code == 429:
+                # Hyperliquid rate limits: respect Retry-After header or back off
+                retry_after = response.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response.json()
+        raise RuntimeError(f"HyperliquidClient.post failed after {_retries} attempts")
 
     def fetch_perp_dexs(self) -> list[dict[str, Any]]:
         data = self.post({"type": "perpDexs"})
