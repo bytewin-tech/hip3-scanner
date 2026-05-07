@@ -57,7 +57,17 @@ def test_evaluate_opportunities_with_l2_confirmation():
     assert opps[0]["score"]["tier"] in {"heads_up", "strong_candidate", "review"}
 
 
-def _paper_opportunity(exec_bps: float, score: float = 4.2, confidence: float = 0.8, tier: str = "strong_candidate"):
+def _paper_opportunity(
+    exec_bps: float,
+    mark_spread_bps: float | None = None,
+    score: float = 4.2,
+    confidence: float = 0.8,
+    tier: str = "strong_candidate",
+):
+    # mark_spread_bps defaults to exec_bps + 1.0, but callers can override.
+    # New arb logic requires mark_spread >= 1.5 * exec (NET_ARB_RATIO check),
+    # so callers targeting the new logic should pass explicit mark_spread_bps.
+    effective_mark = mark_spread_bps if mark_spread_bps is not None else exec_bps + 1.0
     return {
         "opportunity_id": "TSLA|xyz|km|buy_xyz_sell_km",
         "underlying_key": "TSLA",
@@ -68,7 +78,7 @@ def _paper_opportunity(exec_bps: float, score: float = 4.2, confidence: float = 
             "sell_market_id": "km:TSLA",
         },
         "metrics": {
-            "mark_spread_bps": exec_bps + 1.0,
+            "mark_spread_bps": effective_mark,
             "impact_executable_spread_bps": exec_bps,
             "l2_executable_spread_bps": exec_bps,
             "funding_spread_bps": 1.4,
@@ -82,33 +92,38 @@ def test_paper_trader_opens_marks_and_closes(tmp_path):
     config = ScanConfig(paper_trader_enabled=True, paper_state_path=str(tmp_path / "paper_state.json"))
     trader = PaperTrader(build_paper_trader_config(config))
 
-    opened = trader.update({"ts_ms": 1, "ts_iso": "2026-01-01T00:00:00+00:00", "opportunities": [_paper_opportunity(4.0)]})
+    # Entry: exec=4.0, mark=9.0.  mark/exec ratio = 2.25 > 1.5 ✓ → eligible
+    opened = trader.update({"ts_ms": 1, "ts_iso": "2026-01-01T00:00:00+00:00", "opportunities": [_paper_opportunity(exec_bps=4.0, mark_spread_bps=9.0)]})
     assert opened["open_positions"] == 1
     assert opened["cash_usd"] == 750.0
     assert opened["equity_usd"] == 1000.0
 
-    marked = trader.update({"ts_ms": 2, "ts_iso": "2026-01-01T00:01:00+00:00", "opportunities": [_paper_opportunity(1.5)]})
+    # Mark spread still 9.0 → no convergence, unrealized PnL = 0
+    marked = trader.update({"ts_ms": 2, "ts_iso": "2026-01-01T00:01:00+00:00", "opportunities": [_paper_opportunity(exec_bps=1.5, mark_spread_bps=9.0)]})
     assert marked["open_positions"] == 1
-    assert marked["unrealized_pnl_usd"] == 0.0625
-    assert marked["equity_usd"] == 1000.0625
+    assert marked["unrealized_pnl_usd"] == 0.0
+    assert marked["equity_usd"] == 1000.0
 
-    closed = trader.update({"ts_ms": 3, "ts_iso": "2026-01-01T00:02:00+00:00", "opportunities": [_paper_opportunity(0.4)]})
+    # Mark converges to 3.0 (30% of entry 9.0) → close triggered, realized = (9-3)/10000 * $250
+    closed = trader.update({"ts_ms": 3, "ts_iso": "2026-01-01T00:02:00+00:00", "opportunities": [_paper_opportunity(exec_bps=0.4, mark_spread_bps=3.0)]})
     assert closed["open_positions"] == 0
-    assert closed["realized_pnl_usd"] == 0.09
-    assert closed["cash_usd"] == 1000.09
-    assert closed["equity_usd"] == 1000.09
+    assert closed["realized_pnl_usd"] == 0.15
+    assert closed["cash_usd"] == 1000.15
+    assert closed["equity_usd"] == 1000.15
 
 
 def test_paper_trader_state_persists_and_console_shows_summary(tmp_path):
     state_path = tmp_path / "paper_state.json"
     config = ScanConfig(paper_trader_enabled=True, paper_state_path=str(state_path))
+    # mark=7.0, exec=3.2 → ratio=2.19 > 1.5 ✓ → eligible for heads_up tier
     first = PaperTrader(build_paper_trader_config(config))
-    summary = first.update({"ts_ms": 10, "ts_iso": "2026-01-01T00:00:00+00:00", "opportunities": [_paper_opportunity(3.2, tier="heads_up")]})
+    summary = first.update({"ts_ms": 10, "ts_iso": "2026-01-01T00:00:00+00:00", "opportunities": [_paper_opportunity(exec_bps=3.2, mark_spread_bps=7.0, tier="heads_up")]})
     assert state_path.exists()
     assert summary["open_positions"] == 1
 
+    # Second scan: mark=7.0 (same), exec=3.1 → ratio still OK, position stays open
     second = PaperTrader(build_paper_trader_config(config))
-    persisted = second.update({"ts_ms": 11, "ts_iso": "2026-01-01T00:01:00+00:00", "opportunities": [_paper_opportunity(3.1, tier="heads_up")]})
+    persisted = second.update({"ts_ms": 11, "ts_iso": "2026-01-01T00:01:00+00:00", "opportunities": [_paper_opportunity(exec_bps=3.1, mark_spread_bps=7.0, tier="heads_up")]})
     assert persisted["open_positions"] == 1
     assert persisted["cash_usd"] == 750.0
 
@@ -117,7 +132,7 @@ def test_paper_trader_state_persists_and_console_shows_summary(tmp_path):
             "ts_iso": "2026-01-01T00:01:00+00:00",
             "markets_scanned": 2,
             "duplicate_underlyings": 1,
-            "opportunities": [_paper_opportunity(3.1, tier="heads_up")],
+            "opportunities": [_paper_opportunity(exec_bps=3.1, mark_spread_bps=7.0, tier="heads_up")],
             "paper_portfolio": persisted,
         }
     )

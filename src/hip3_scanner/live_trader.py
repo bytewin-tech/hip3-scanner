@@ -211,7 +211,7 @@ class LiveTrader:
             if current_exec is None:
                 current_exec = position["last_exec_spread_bps"]
 
-            # In dry_run: use spread-based PnL (same as paper)
+            # In dry_run: use mark-spread convergence (same as paper)
             # In live: reconcile with exchange position PnL
             exchange_pos = None
             if not self.config.dry_run:
@@ -222,15 +222,14 @@ class LiveTrader:
                 position["unrealized_pnl_usd"] = round(float(exchange_pos.unrealized_pnl), 6)
                 position["last_exec_spread_bps"] = current_exec
             else:
-                # Fall back to fill-price PnL (dry_run or position not yet on exchange)
-                entry_px = Decimal(str(position.get("entry_fill_price", position["entry_exec_spread_bps"])))
-                # Current price: estimate from spread
-                spread_bps = Decimal(str(current_exec))
-                current_px = entry_px * (BPS_DIVISOR + spread_bps) / BPS_DIVISOR
-                notional = Decimal(str(position["notional_usd"]))
-                unrealized = (current_px - entry_px) * (notional / entry_px)
-                position["unrealized_pnl_usd"] = round(float(unrealized), 6)
+                # Fall back to mark-spread PnL (dry_run or position not yet on exchange)
+                # The real arb signal is the venue-to-venue mark spread converging, not exec spread cost
+                current_mark = self._metric_or_default(opp, "mark_spread_bps", position.get("last_mark_spread_bps", 0))
+                entry_mark = position.get("entry_mark_spread_bps", position.get("entry_spread_bps", 0))
+                unrealized = self._spread_pnl(entry_mark, current_mark, position["notional_usd"])
+                position["unrealized_pnl_usd"] = unrealized
                 position["last_exec_spread_bps"] = current_exec
+                position["last_mark_spread_bps"] = current_mark
 
             position["last_scan_ts_ms"] = result["ts_ms"]
             position["last_scan_ts_iso"] = result["ts_iso"]
@@ -337,8 +336,10 @@ class LiveTrader:
                     "sell_venue": opp["direction"]["sell_venue"],
                     "entry_exec_spread_bps": self._current_exec_spread_bps(opp),
                     "entry_spread_bps": opp["metrics"]["mark_spread_bps"],
+                    "entry_mark_spread_bps": opp["metrics"]["mark_spread_bps"],
                     "entry_funding_spread_bps": opp["metrics"]["funding_spread_bps"],
                     "last_exec_spread_bps": self._current_exec_spread_bps(opp),
+                    "last_mark_spread_bps": opp["metrics"]["mark_spread_bps"],
                     "last_funding_spread_bps": opp["metrics"]["funding_spread_bps"],
                     "notional_usd": round(notional, 6),
                     "holding_scans": 0,
@@ -384,13 +385,18 @@ class LiveTrader:
     # ------------------------------------------------------------------
 
     def _close_reason(self, position: dict[str, Any], opp: dict[str, Any] | None) -> str | None:
+        entry_mark = Decimal(str(position.get("entry_mark_spread_bps", position.get("entry_spread_bps", 0))))
+        current_mark = Decimal(str(position.get("last_mark_spread_bps", 0)))
         last_exec = Decimal(str(position["last_exec_spread_bps"]))
         notional = Decimal(str(position["notional_usd"]))
         pnl_pct = Decimal(str(position["unrealized_pnl_usd"])) / notional if notional else Decimal("0")
         if not position.get("signal_present", True):
             return "signal_missing"
-        if last_exec <= self.config.close_exec_spread_bps:
+        # Close when mark spread has converged (venue prices aligning = arb captured)
+        if entry_mark > 0 and current_mark <= entry_mark * Decimal("0.3"):
             return "spread_converged"
+        if last_exec <= self.config.close_exec_spread_bps:
+            return "exec_cost_too_high"
         if float(position["last_score"]) < self.config.close_score_below:
             return "score_deteriorated"
         if position["holding_scans"] >= self.config.max_holding_scans:
@@ -402,12 +408,20 @@ class LiveTrader:
         return None
 
     def _eligible_entry(self, opp: dict[str, Any]) -> bool:
-        exec_spread = Decimal(str(self._current_exec_spread_bps(opp)))
+        exec_spread = self._current_exec_spread_bps(opp)
+        if exec_spread is None:
+            return False
+        exec_bps = Decimal(str(exec_spread))
+        mark_spread = Decimal(str(opp["metrics"]["mark_spread_bps"]))
+        # Minimum net arb buffer: mark spread must exceed exec spread by at least 1.5×.
+        NET_ARB_RATIO = Decimal("1.5")
+        if mark_spread < exec_bps * NET_ARB_RATIO:
+            return False
         return (
             opp["score"]["tier"] in self.config.allowed_entry_tiers
             and float(opp["score"]["raw_score"]) >= self.config.min_entry_score
             and float(opp["score"]["confidence"]) >= self.config.min_entry_confidence
-            and exec_spread >= self.config.min_entry_exec_spread_bps
+            and exec_bps >= self.config.min_entry_exec_spread_bps
         )
 
     # ------------------------------------------------------------------

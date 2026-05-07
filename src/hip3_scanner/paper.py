@@ -110,10 +110,21 @@ class PaperTrader:
             current_exec = self._current_exec_spread_bps(opp)
             if current_exec is None:
                 current_exec = position["last_exec_spread_bps"]
-            spread_pnl = self._spread_pnl(position["entry_exec_spread_bps"], current_exec, position["notional_usd"])
+
+            # PnL is based on MARK SPREAD convergence (the real arb signal),
+            # not execution spread (a per-scan cost that barely changes).
+            # Spread converges when the venue price gap shrinks → we profit.
+            current_mark = self._metric_or_default(opp, "mark_spread_bps", position.get("last_mark_spread_bps", 0))
+            spread_pnl = self._spread_pnl(
+                position.get("entry_mark_spread_bps", position["entry_spread_bps"]),
+                current_mark,
+                position["notional_usd"],
+            )
+
             position["last_scan_ts_ms"] = result["ts_ms"]
             position["last_scan_ts_iso"] = result["ts_iso"]
             position["last_exec_spread_bps"] = current_exec
+            position["last_mark_spread_bps"] = current_mark
             position["last_funding_spread_bps"] = self._metric_or_default(opp, "funding_spread_bps", position["last_funding_spread_bps"])
             position["last_score"] = opp["score"]["raw_score"] if opp else position["last_score"]
             position["last_confidence"] = opp["score"]["confidence"] if opp else position["last_confidence"]
@@ -167,8 +178,10 @@ class PaperTrader:
                 "sell_venue": opp["direction"]["sell_venue"],
                 "entry_exec_spread_bps": self._current_exec_spread_bps(opp),
                 "entry_spread_bps": opp["metrics"]["mark_spread_bps"],
+                "entry_mark_spread_bps": opp["metrics"]["mark_spread_bps"],
                 "entry_funding_spread_bps": opp["metrics"]["funding_spread_bps"],
                 "last_exec_spread_bps": self._current_exec_spread_bps(opp),
+                "last_mark_spread_bps": opp["metrics"]["mark_spread_bps"],
                 "last_funding_spread_bps": opp["metrics"]["funding_spread_bps"],
                 "notional_usd": round(notional, 6),
                 "holding_scans": 0,
@@ -185,12 +198,19 @@ class PaperTrader:
             open_count += 1
 
     def _close_reason(self, position: dict[str, Any], opp: dict[str, Any] | None) -> str | None:
+        entry_mark = Decimal(str(position.get("entry_mark_spread_bps", position.get("entry_spread_bps", 0))))
+        current_mark = Decimal(str(position.get("last_mark_spread_bps", 0)))
         last_exec = Decimal(str(position["last_exec_spread_bps"]))
-        pnl_pct = Decimal(str(position["unrealized_pnl_usd"])) / Decimal(str(position["notional_usd"])) if position["notional_usd"] else Decimal("0")
+        notional = Decimal(str(position["notional_usd"]))
+        pnl_pct = Decimal(str(position["unrealized_pnl_usd"])) / notional if notional else Decimal("0")
         if not position.get("signal_present", True):
             return "signal_missing"
-        if last_exec <= self.config.close_exec_spread_bps:
+        # Close when mark spread has converged (venue prices aligning = arb captured)
+        # Converged means: current mark spread is close to zero, or has shrunk significantly
+        if entry_mark > 0 and current_mark <= entry_mark * Decimal("0.3"):
             return "spread_converged"
+        if last_exec <= self.config.close_exec_spread_bps:
+            return "exec_cost_too_high"
         if float(position["last_score"]) < self.config.close_score_below:
             return "score_deteriorated"
         if position["holding_scans"] >= self.config.max_holding_scans:
@@ -281,12 +301,22 @@ class PaperTrader:
                 state["safety_pause_ts_iso"] = None
 
     def _eligible_entry(self, opp: dict[str, Any]) -> bool:
-        exec_spread = Decimal(str(self._current_exec_spread_bps(opp)))
+        exec_spread = self._current_exec_spread_bps(opp)
+        if exec_spread is None:
+            return False
+        exec_bps = Decimal(str(exec_spread))
+        mark_spread = Decimal(str(opp["metrics"]["mark_spread_bps"]))
+        # Minimum net arb buffer: mark spread must exceed exec spread by at least 1.5×.
+        # e.g. if exec costs 5bps, need ≥7.5bps mark spread just to break even on costs.
+        # Only then does spread convergence → profit.
+        NET_ARB_RATIO = Decimal("1.5")
+        if mark_spread < exec_bps * NET_ARB_RATIO:
+            return False
         return (
             opp["score"]["tier"] in self.config.allowed_entry_tiers
             and float(opp["score"]["raw_score"]) >= self.config.min_entry_score
             and float(opp["score"]["confidence"]) >= self.config.min_entry_confidence
-            and exec_spread >= self.config.min_entry_exec_spread_bps
+            and exec_bps >= self.config.min_entry_exec_spread_bps
         )
 
     def _recompute_totals(self, state: dict[str, Any]) -> None:
